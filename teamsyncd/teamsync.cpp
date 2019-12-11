@@ -12,6 +12,8 @@
 #include "warm_restart.h"
 #include "teamsync.h"
 
+#include <unistd.h>
+
 using namespace std;
 using namespace std::chrono;
 using namespace swss;
@@ -25,17 +27,18 @@ TeamSync::TeamSync(DBConnector *db, DBConnector *stateDb, Select *select) :
     m_lagMemberTable(db, APP_LAG_MEMBER_TABLE_NAME),
     m_stateLagTable(stateDb, STATE_LAG_TABLE_NAME)
 {
-    WarmStart::initialize("teamsyncd", "teamd");
-    WarmStart::checkWarmStart("teamsyncd", "teamd");
+    WarmStart::initialize(TEAMSYNCD_APP_NAME, "teamd");
+    WarmStart::checkWarmStart(TEAMSYNCD_APP_NAME, "teamd");
     m_warmstart = WarmStart::isWarmStart();
 
     if (m_warmstart)
     {
         m_start_time = steady_clock::now();
-        auto warmRestartIval = WarmStart::getWarmStartTimer("teamsyncd", "teamd");
+        auto warmRestartIval = WarmStart::getWarmStartTimer(TEAMSYNCD_APP_NAME, "teamd");
         m_pending_timeout = warmRestartIval ? warmRestartIval : DEFAULT_WR_PENDING_TIMEOUT;
         m_lagTable.create_temp_view();
         m_lagMemberTable.create_temp_view();
+        WarmStart::setWarmStartState(TEAMSYNCD_APP_NAME, WarmStart::INITIALIZED);
         SWSS_LOG_NOTICE("Starting in warmstart mode");
     }
 }
@@ -49,6 +52,7 @@ void TeamSync::periodic()
         {
             applyState();
             m_warmstart = false; // apply state just once
+            WarmStart::setWarmStartState(TEAMSYNCD_APP_NAME, WarmStart::RECONCILED);
         }
     }
 
@@ -107,18 +111,22 @@ void TeamSync::onMsg(int nlmsg_type, struct nl_object *obj)
 
     if (nlmsg_type == RTM_DELLINK)
     {
-        /* Remove LAG ports and delete LAG */
-        removeLag(lagName);
+        if (m_teamSelectables.find(lagName) != m_teamSelectables.end())
+        {
+            /* Remove LAG ports and delete LAG */
+            removeLag(lagName);
+        }
         return;
     }
 
+    unsigned int mtu = rtnl_link_get_mtu(link);
     addLag(lagName, rtnl_link_get_ifindex(link),
            rtnl_link_get_flags(link) & IFF_UP,
-           rtnl_link_get_flags(link) & IFF_LOWER_UP);
+           rtnl_link_get_flags(link) & IFF_LOWER_UP, mtu);
 }
 
 void TeamSync::addLag(const string &lagName, int ifindex, bool admin_state,
-                      bool oper_state)
+                      bool oper_state, unsigned int mtu)
 {
     /* Set the LAG */
     std::vector<FieldValueTuple> fvVector;
@@ -128,8 +136,8 @@ void TeamSync::addLag(const string &lagName, int ifindex, bool admin_state,
     fvVector.push_back(o);
     m_lagTable.set(lagName, fvVector);
 
-    SWSS_LOG_INFO("Add %s admin_status:%s oper_status:%s",
-                   lagName.c_str(), admin_state ? "up" : "down", oper_state ? "up" : "down");
+    SWSS_LOG_INFO("Add %s admin_status:%s oper_status:%s, mtu: %d",
+                   lagName.c_str(), admin_state ? "up" : "down", oper_state ? "up" : "down", mtu);
 
     /* Return when the team instance has already been tracked */
     if (m_teamSelectables.find(lagName) != m_teamSelectables.end())
@@ -160,12 +168,15 @@ void TeamSync::removeLag(const string &lagName)
     for (auto it : selectable->m_lagMembers)
     {
         m_lagMemberTable.del(lagName + ":" + it.first);
+
+        SWSS_LOG_INFO("Remove member %s before removing LAG %s",
+                it.first.c_str(), lagName.c_str());
     }
 
     /* Delete the LAG */
     m_lagTable.del(lagName);
 
-    SWSS_LOG_INFO("Remove %s", lagName.c_str());
+    SWSS_LOG_INFO("Remove LAG %s", lagName.c_str());
 
     /* Return when the team instance hasn't been tracked before */
     if (m_teamSelectables.find(lagName) == m_teamSelectables.end())
@@ -194,32 +205,54 @@ TeamSync::TeamPortSync::TeamPortSync(const string &lagName, int ifindex,
     m_lagName(lagName),
     m_ifindex(ifindex)
 {
-    m_team = team_alloc();
-    if (!m_team)
-    {
-        SWSS_LOG_ERROR("Unable to allocated team socket");
-        throw system_error(make_error_code(errc::address_not_available),
-                           "Unable to allocated team socket");
-    }
+    int count = 0;
+    int max_retries = 3;
 
-    int err = team_init(m_team, ifindex);
-    if (err)
+    while (true)
     {
-        team_free(m_team);
-        m_team = NULL;
-        SWSS_LOG_ERROR("Unable to init team socket");
-        throw system_error(make_error_code(errc::address_not_available),
-                           "Unable to init team socket");
-    }
+        try
+        {
+            m_team = team_alloc();
+            if (!m_team)
+            {
+                throw system_error(make_error_code(errc::address_not_available),
+                                   "Unable to allocate team socket");
+            }
 
-    err = team_change_handler_register(m_team, &gPortChangeHandler, this);
-    if (err)
-    {
-        team_free(m_team);
-        m_team = NULL;
-        SWSS_LOG_ERROR("Unable to register port change event");
-        throw system_error(make_error_code(errc::address_not_available),
-                           "Unable to register port change event");
+            int err = team_init(m_team, ifindex);
+            if (err)
+            {
+                team_free(m_team);
+                m_team = NULL;
+                throw system_error(make_error_code(errc::address_not_available),
+                                   "Unable to initialize team socket");
+            }
+
+            err = team_change_handler_register(m_team, &gPortChangeHandler, this);
+            if (err)
+            {
+                team_free(m_team);
+                m_team = NULL;
+                throw system_error(make_error_code(errc::address_not_available),
+                                   "Unable to register port change event");
+            }
+
+            break;
+        }
+        catch (const system_error& e)
+        {
+            if (++count == max_retries)
+            {
+                throw;
+            }
+            else
+            {
+                SWSS_LOG_WARN("Failed to initialize team handler. LAG=%s error=%d:%s, attempt=%d",
+                              lagName.c_str(), e.code().value(), e.what(), count);
+            }
+
+            sleep(1);
+        }
     }
 
     /* Sync LAG at first */
@@ -276,6 +309,9 @@ int TeamSync::TeamPortSync::onChange()
             FieldValueTuple l("status", it.second ? "enabled" : "disabled");
             v.push_back(l);
             m_lagMemberTable->set(key, v);
+
+            SWSS_LOG_INFO("Set LAG %s member %s with status %s",
+                    m_lagName.c_str(), it.first.c_str(), it.second ? "enabled" : "disabled");
         }
     }
 
@@ -285,6 +321,9 @@ int TeamSync::TeamPortSync::onChange()
         {
             string key = m_lagName + ":" + it.first;
             m_lagMemberTable->del(key);
+
+            SWSS_LOG_INFO("Remove member %s from LAG %s",
+                    it.first.c_str(), m_lagName.c_str());
         }
     }
 
@@ -304,7 +343,8 @@ int TeamSync::TeamPortSync::getFd()
     return team_get_event_fd(m_team);
 }
 
-void TeamSync::TeamPortSync::readData()
+uint64_t TeamSync::TeamPortSync::readData()
 {
     team_handle_events(m_team);
+    return 0;
 }

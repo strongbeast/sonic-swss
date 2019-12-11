@@ -23,6 +23,8 @@ def pytest_addoption(parser):
                       help="dvs name")
     parser.addoption("--keeptb", action="store_true", default=False,
                       help="keep testbed after test")
+    parser.addoption("--imgname", action="store", default="docker-sonic-vs",
+                      help="image name")
 
 class AsicDbValidator(object):
     def __init__(self, dvs):
@@ -142,7 +144,7 @@ class VirtualServer(object):
         return subprocess.check_output("ip netns exec %s %s" % (self.nsname, cmd), shell=True)
 
 class DockerVirtualSwitch(object):
-    def __init__(self, name=None, keeptb=False):
+    def __init__(self, name=None, imgname=None, keeptb=False, fakeplatform=None):
         self.basicd = ['redis-server',
                        'rsyslogd']
         self.swssd = ['orchagent',
@@ -157,6 +159,9 @@ class DockerVirtualSwitch(object):
         self.teamd = ['teamsyncd', 'teammgrd']
         self.alld  = self.basicd + self.swssd + self.syncd + self.rtd + self.teamd
         self.client = docker.from_env()
+
+        if subprocess.check_call(["/sbin/modprobe", "team"]) != 0:
+            raise NameError("cannot install kernel team module")
 
         self.ctn = None
         if keeptb:
@@ -208,8 +213,11 @@ class DockerVirtualSwitch(object):
             self.mount = "/var/run/redis-vs/{}".format(self.ctn_sw.name)
             os.system("mkdir -p {}".format(self.mount))
 
+            self.environment = ["fake_platform={}".format(fakeplatform)] if fakeplatform else []
+
             # create virtual switch container
-            self.ctn = self.client.containers.run('docker-sonic-vs', privileged=True, detach=True,
+            self.ctn = self.client.containers.run(imgname, privileged=True, detach=True,
+                    environment=self.environment,
                     network_mode="container:%s" % self.ctn_sw.name,
                     volumes={ self.mount: { 'bind': '/var/run/redis', 'mode': 'rw' } })
 
@@ -224,6 +232,7 @@ class DockerVirtualSwitch(object):
             self.init_asicdb_validator()
             self.appldb = ApplDbValidator(self)
         except:
+            self.get_logs()
             self.destroy()
             raise
 
@@ -326,7 +335,7 @@ class DockerVirtualSwitch(object):
         time.sleep(5)
 
     def stop_zebra(dvs):
-        dvs.runcmd(['sh', '-c', 'pkill -x zebra'])
+        dvs.runcmd(['sh', '-c', 'pkill -9 zebra'])
         time.sleep(1)
 
     def start_fpmsyncd(dvs):
@@ -540,6 +549,20 @@ class DockerVirtualSwitch(object):
 
         return iface_2_bridge_port_id
 
+    def get_vlan_oid(self, asic_db, vlan_id):
+        tbl = swsscommon.Table(asic_db, "ASIC_STATE:SAI_OBJECT_TYPE_VLAN")
+        keys = tbl.getKeys()
+
+        for key in keys:
+            status, fvs = tbl.get(key)
+            assert status, "Error reading from table %s" % "ASIC_STATE:SAI_OBJECT_TYPE_VLAN"
+
+            for k, v in fvs:
+                if k == "SAI_VLAN_ATTR_VLAN_ID" and v == vlan_id:
+                    return True, key
+
+        return False, "Not found vlan id %s" % vlan_id
+
     def is_table_entry_exists(self, db, table, keyregex, attributes):
         tbl = swsscommon.Table(db, table)
         keys = tbl.getKeys()
@@ -629,11 +652,15 @@ class DockerVirtualSwitch(object):
             except ValueError:
                 d_key = json.loads('{' + key + '}')
 
+            key_found = True
+
             for k, v in key_values:
                 if k not in d_key or v != d_key[k]:
-                    continue
+                    key_found = False
+                    break
 
-            key_found = True
+            if not key_found:
+                continue
 
             status, fvs = tbl.get(key)
             assert status, "Error reading from table %s" % table
@@ -662,10 +689,20 @@ class DockerVirtualSwitch(object):
         tbl.set("Vlan" + vlan, fvs)
         time.sleep(1)
 
+    def remove_vlan(self, vlan):
+        tbl = swsscommon.Table(self.cdb, "VLAN")
+        tbl._del("Vlan" + vlan)
+        time.sleep(1)
+
     def create_vlan_member(self, vlan, interface):
         tbl = swsscommon.Table(self.cdb, "VLAN_MEMBER")
         fvs = swsscommon.FieldValuePairs([("tagging_mode", "untagged")])
         tbl.set("Vlan" + vlan + "|" + interface, fvs)
+        time.sleep(1)
+
+    def remove_vlan_member(self, vlan, interface):
+        tbl = swsscommon.Table(self.cdb, "VLAN_MEMBER")
+        tbl._del("Vlan" + vlan + "|" + interface)
         time.sleep(1)
 
     def create_vlan_member_tagged(self, vlan, interface):
@@ -692,7 +729,7 @@ class DockerVirtualSwitch(object):
         else:
             tbl_name = "PORT"
         tbl = swsscommon.Table(self.cdb, tbl_name)
-        fvs = swsscommon.FieldValuePairs([("admin_status", "up")])
+        fvs = swsscommon.FieldValuePairs([("admin_status", admin_status)])
         tbl.set(interface, fvs)
         time.sleep(1)
 
@@ -705,7 +742,32 @@ class DockerVirtualSwitch(object):
             tbl_name = "INTERFACE"
         tbl = swsscommon.Table(self.cdb, tbl_name)
         fvs = swsscommon.FieldValuePairs([("NULL", "NULL")])
+        tbl.set(interface, fvs)
         tbl.set(interface + "|" + ip, fvs)
+        time.sleep(1)
+
+    def remove_ip_address(self, interface, ip):
+        if interface.startswith("PortChannel"):
+            tbl_name = "PORTCHANNEL_INTERFACE"
+        elif interface.startswith("Vlan"):
+            tbl_name = "VLAN_INTERFACE"
+        else:
+            tbl_name = "INTERFACE"
+        tbl = swsscommon.Table(self.cdb, tbl_name)
+        tbl._del(interface + "|" + ip);
+        tbl._del(interface);
+        time.sleep(1)
+
+    def set_mtu(self, interface, mtu):
+        if interface.startswith("PortChannel"):
+            tbl_name = "PORTCHANNEL"
+        elif interface.startswith("Vlan"):
+            tbl_name = "VLAN"
+        else:
+            tbl_name = "PORT"
+        tbl = swsscommon.Table(self.cdb, tbl_name)
+        fvs = swsscommon.FieldValuePairs([("mtu", mtu)])
+        tbl.set(interface, fvs)
         time.sleep(1)
 
     def add_neighbor(self, interface, ip, mac):
@@ -713,6 +775,11 @@ class DockerVirtualSwitch(object):
         fvs = swsscommon.FieldValuePairs([("neigh", mac),
                                           ("family", "IPv4")])
         tbl.set(interface + ":" + ip, fvs)
+        time.sleep(1)
+
+    def remove_neighbor(self, interface, ip):
+        tbl = swsscommon.ProducerStateTable(self.pdb, "NEIGH_TABLE")
+        tbl._del(interface + ":" + ip)
         time.sleep(1)
 
     def setup_db(self):
@@ -754,7 +821,9 @@ class DockerVirtualSwitch(object):
 def dvs(request):
     name = request.config.getoption("--dvsname")
     keeptb = request.config.getoption("--keeptb")
-    dvs = DockerVirtualSwitch(name, keeptb)
+    imgname = request.config.getoption("--imgname")
+    fakeplatform = getattr(request.module, "DVS_FAKE_PLATFORM", None)
+    dvs = DockerVirtualSwitch(name, imgname, keeptb, fakeplatform)
     yield dvs
     if name == None:
         dvs.get_logs(request.module.__name__)

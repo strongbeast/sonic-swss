@@ -55,8 +55,10 @@ class PortsOrch : public Orch, public Subject
 public:
     PortsOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames);
 
-    bool isPortReady();
+    bool allPortsReady();
     bool isInitDone();
+    bool isConfigDone();
+    bool isPortAdminUp(const string &alias);
 
     map<string, Port>& getAllPorts();
     bool bake() override;
@@ -65,6 +67,8 @@ public:
     bool setBridgePortLearningFDB(Port &port, sai_bridge_port_fdb_learning_mode_t mode);
     bool getPort(string alias, Port &port);
     bool getPort(sai_object_id_t id, Port &port);
+    void increasePortRefCount(const string &alias);
+    void decreasePortRefCount(const string &alias);
     bool getPortByBridgePortId(sai_object_id_t bridge_port_id, Port &port);
     void setPort(string alias, Port port);
     void getCpuPort(Port &port);
@@ -84,6 +88,9 @@ public:
 
     void refreshPortStatus();
     bool removeAclTableGroup(const Port &p);
+
+    bool addSubPort(Port &port, const string &alias, const bool &adminUp = true, const uint32_t &mtu = 0);
+    bool removeSubPort(const string &alias);
 private:
     unique_ptr<Table> m_counterTable;
     unique_ptr<Table> m_portTable;
@@ -113,14 +120,22 @@ private:
     sai_object_id_t m_default1QBridge;
     sai_object_id_t m_defaultVlan;
 
-    bool m_portConfigDone = false;
+    typedef enum
+    {
+        PORT_CONFIG_MISSING,
+        PORT_CONFIG_RECEIVED,
+        PORT_CONFIG_DONE,
+    } port_config_state_t;
+
+    port_config_state_t m_portConfigState = PORT_CONFIG_MISSING;
     sai_uint32_t m_portCount;
     map<set<int>, sai_object_id_t> m_portListLaneMap;
     map<set<int>, tuple<string, uint32_t, int, string>> m_lanesAliasSpeedMap;
     map<string, Port> m_portList;
-
+    map<string, uint32_t> m_port_ref_count;
     unordered_set<string> m_pendingPortSet;
 
+	
     NotificationConsumer* m_portStatusNotificationConsumer;
 
     void doTask(Consumer &consumer);
@@ -144,6 +159,7 @@ private:
 
     bool addBridgePort(Port &port);
     bool removeBridgePort(Port &port);
+    bool setBridgePortLearnMode(Port &port, string learn_mode);
 
     bool addVlan(string vlan);
     bool removeVlan(Port vlan);
@@ -189,6 +205,11 @@ private:
 
     bool getPortOperStatus(const Port& port, sai_port_oper_status_t& status) const;
     void updatePortOperStatus(Port &port, sai_port_oper_status_t status);
+
+    void getPortSerdesVal(const std::string& s, std::vector<uint32_t> &lane_values);
+
+    bool setPortSerdesAttribute(sai_object_id_t port_id, sai_attr_id_t attr_id,
+                                vector<uint32_t> &serdes_val);
 };
 #endif /* SWSS_PORTSORCH_H */
 

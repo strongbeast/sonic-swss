@@ -26,6 +26,9 @@
 #include "countercheckorch.h"
 #include "flexcounterorch.h"
 #include "watermarkorch.h"
+#include "policerorch.h"
+#include "sfloworch.h"
+#include "debugcounterorch.h"
 #include "directory.h"
 
 using namespace swss;
